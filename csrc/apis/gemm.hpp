@@ -539,7 +539,7 @@ static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
     DG_HOST_ASSERT(a.is_contiguous());
     DG_HOST_ASSERT(b.is_contiguous());
     DG_HOST_ASSERT(d.is_contiguous());
-    DG_HOST_ASSERT(c.has_value() and c.value().is_contiguous());
+    if (c.has_value()) DG_HOST_ASSERT(c.value().is_contiguous());
 
     // Early return for trivial cases
     if (early_return(m, n, std::accumulate(ks.begin(), ks.end(), 0), d, c))
