@@ -1,0 +1,103 @@
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainJob
+metadata:
+  name: jangwoong-dg-mxfp8v7
+  namespace: kbm-g-np-motif
+spec:
+  podTemplateOverrides:
+    - metadata:
+        annotations:
+          k8s.v1.cni.cncf.io/networks: |-
+            kbm-g-np-motif,
+            kbm-g-np-motif,
+            kbm-g-np-motif,
+            kbm-g-np-motif,
+            kbm-g-np-motif,
+            kbm-g-np-motif,
+            kbm-g-np-motif,
+            kbm-g-np-motif
+      spec:
+        containers:
+          - name: node
+            volumeMounts:
+              - mountPath: /dev/shm
+                name: shm
+              - mountPath: /mair
+                name: mair
+        volumes:
+          - emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+            name: shm
+          - name: mair
+            persistentVolumeClaim:
+              claimName: mair
+      targetJobs:
+        - name: node
+  runtimeRef:
+    apiGroup: trainer.kubeflow.org
+    kind: ClusterTrainingRuntime
+    name: torch-distributed
+  suspend: false
+  trainer:
+    args:
+      - /bin/bash
+      - '-c'
+      - |
+        echo "=== MXFP8 Epilogue Test on $(hostname) ==="
+        nvidia-smi | head -5
+
+        # Install DeepGEMM (force rebuild)
+        cd /mair/team-sys/jangwoong/DeepGEMM
+        rm -f deep_gemm/_C.cpython-*.so
+        rm -rf build/
+        DG_USE_LOCAL_VERSION=0 pip install -e . --no-build-isolation -q 2>&1 | tail -3
+        DG_USE_LOCAL_VERSION=0 python setup.py build_ext --inplace --force 2>&1 | tail -5
+        python -c "import deep_gemm._C; print('Loaded:', deep_gemm._C.__file__)"
+
+        export DEEPGEMM_ROOT=/mair/team-sys/jangwoong/DeepGEMM
+        export PYTHONPATH=$PYTHONPATH:$DEEPGEMM_ROOT
+        export CPATH=$DEEPGEMM_ROOT/third-party/cutlass/include:${CPATH:-}
+        export CPLUS_INCLUDE_PATH=$DEEPGEMM_ROOT/third-party/cutlass/include:${CPLUS_INCLUDE_PATH:-}
+        export DG_JIT_CACHE_DIR=/mair/torch_cache/deepgemm/jangwoong-mxfp8-test
+        rm -rf $DG_JIT_CACHE_DIR
+        mkdir -p $DG_JIT_CACHE_DIR
+
+        # Run breakdown + profiling
+        cd /mair/team-sys/jangwoong/DeepGEMM
+        find . -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+        mkdir -p traces
+        cd tests
+        python -B test_mxfp8_profile.py 2>&1
+
+        echo "=== Test complete ==="
+    env:
+      - name: PYTHONUNBUFFERED
+        value: '1'
+      - name: CUDA_VISIBLE_DEVICES
+        value: '0'
+      - name: CUDA_LAUNCH_BLOCKING
+        value: '1'
+      - name: NODE_NAME
+        valueFrom:
+          fieldRef:
+            fieldPath: spec.nodeName
+      - name: JOB_NAME
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.labels['job-name']
+    image: >-
+      ghcr.io/motiftechnologies/llm-training:v0.1.6
+    numNodes: 1
+    numProcPerNode: 8
+    resourcesPerNode:
+      limits:
+        cpu: '96'
+        memory: 1024Gi
+        nvidia.com/gpu: '8'
+        nvidia.com/mlnxnics: '8'
+      requests:
+        cpu: '96'
+        memory: 1024Gi
+        nvidia.com/gpu: '8'
+        nvidia.com/mlnxnics: '8'

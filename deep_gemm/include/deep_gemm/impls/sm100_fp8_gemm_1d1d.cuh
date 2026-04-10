@@ -33,7 +33,10 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_sfb,
-                         const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
+                         const __grid_constant__ cute::TmaDescriptor tensor_map_cd,
+                         const __grid_constant__ cute::TmaDescriptor tensor_map_cd_sf,
+                         uint8_t* gmem_cd_sf_ptr, uint32_t cd_sf_stride,
+                         uint8_t* gmem_cd_fp8_ptr, uint32_t cd_fp8_stride) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
@@ -41,6 +44,9 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     // GEMM with accumulation must have FP32 output
     if constexpr (kWithAccumulation)
         DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float>, "Invalid C/D data dtype");
+
+    // MXFP8 output mode: use FP32 SMEM path internally, then convert to FP8 + E8M0 scales
+    constexpr bool kIsMXFP8Output = cute::is_same_v<cd_dtype_t, cutlass::float_e4m3_t>;
 
     // Configs
     constexpr uint32_t LAYOUT_AD_M = 128;
@@ -75,7 +81,9 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / (kIsMulticastOnA ? kNumMulticast: 1);
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N / (kIsMulticastOnA ? 1 : kNumMulticast);
     constexpr uint32_t STORE_BLOCK_M = cute::min<uint32_t>(BLOCK_M, LAYOUT_AD_M);
-    constexpr uint32_t STORE_BLOCK_N = kSwizzleCDMode / sizeof(cd_dtype_t);
+    // For MXFP8 output, use FP32 TMEM load granularity internally
+    using internal_cd_dtype_t = cute::conditional_t<kIsMXFP8Output, float, cd_dtype_t>;
+    constexpr uint32_t STORE_BLOCK_N = kSwizzleCDMode / sizeof(internal_cd_dtype_t);
     constexpr uint32_t kNumUMMAStoreThreads = STORE_BLOCK_M;
     DG_STATIC_ASSERT(not kIsMulticastOnA or kNumMulticast == 1, "Invalid multicast");
     DG_STATIC_ASSERT(LOAD_BLOCK_M == BLOCK_M, "Only support tensor memory layout A/D");
@@ -83,6 +91,9 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     DG_STATIC_ASSERT(kNumUMMAStoreThreads % 32 == 0, "Invalid store block M");
 
     // Share memory sizes
+    // For MXFP8: SMEM_CD holds FP8 output + E8M0 scales (separate from TMEM load staging)
+    constexpr uint32_t SMEM_CD_FP8_SIZE = kIsMXFP8Output ? constexpr_align(STORE_BLOCK_M * BLOCK_N, 1024u) : 0;
+    constexpr uint32_t SMEM_CD_SF_SIZE = kIsMXFP8Output ? constexpr_align(STORE_BLOCK_M * (BLOCK_N / 32), 128u) : 0;
     constexpr uint32_t SMEM_CD_SIZE_PER_STAGE = STORE_BLOCK_M * kSwizzleCDMode;
     constexpr uint32_t SMEM_CD_SIZE = SMEM_CD_SIZE_PER_STAGE * kNumTMAStoreStages;
     constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(a_dtype_t);
@@ -118,6 +129,8 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
         cute::prefetch_tma_descriptor(&tensor_map_sfa);
         cute::prefetch_tma_descriptor(&tensor_map_sfb);
         cute::prefetch_tma_descriptor(&tensor_map_cd);
+        if constexpr (kIsMXFP8Output)
+            cute::prefetch_tma_descriptor(&tensor_map_cd_sf);
     }
 
     // D/A/B shared memory
@@ -434,7 +447,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
 
         // TMA checks
         constexpr uint32_t kNumBankGroupBytes = 16;
-        constexpr uint32_t kNumElemsPerBankGroup = kNumBankGroupBytes / sizeof(cd_dtype_t);
+        constexpr uint32_t kNumElemsPerBankGroup = kNumBankGroupBytes / sizeof(internal_cd_dtype_t);
         DG_STATIC_ASSERT(kSwizzleCDMode > 0, "TMA D must be swizzled");
         DG_STATIC_ASSERT(STORE_BLOCK_N % kNumElemsPerBankGroup == 0, "Invalid swizzling");
 
@@ -457,91 +470,152 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
             DG_STATIC_ASSERT(kNumEpilogueThreads == 128, "Epilogue threads not enough");
             DG_STATIC_ASSERT(BLOCK_N % STORE_BLOCK_N == 0, "Invalid block sizes");
 
-            // Iterate over M waves
-            #pragma unroll
-            for (uint32_t w = 0; w < kNumMWaves; ++ w) {
-                // Issue every swizzled atom and pipeline STSM and TMA store
-                constexpr uint32_t kNumStores = BLOCK_N / STORE_BLOCK_N;
+            if constexpr (not kIsMXFP8Output) {
+                // Original epilogue: TMEM → SMEM → TMA store
                 #pragma unroll
-                for (uint32_t s = 0; s < kNumStores; ++ s, advance_store_pipeline()) {
-                    // Wait shared memory to be released
-                    if (epilogue_warp_idx == 0)
-                        cute::tma_store_wait<kNumTMAStoreStages - 1>();
-                    cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
-
-                    // The pipeline stage
-                    const auto m_idx = scheduler.template get_global_idx<(not is_m_grouped_contiguous(kGemmType)), IndexType::MN>(shape_m, BLOCK_M, m_block_idx) + w * WAVE_BLOCK_M;
-                    const auto n_idx = epilogue_type_t::apply_index_n<STORE_BLOCK_N>(n_block_idx * BLOCK_N + s * STORE_BLOCK_N);
-
-                    // Store into shared memory
+                for (uint32_t w = 0; w < kNumMWaves; ++ w) {
+                    constexpr uint32_t kNumStores = BLOCK_N / STORE_BLOCK_N;
                     #pragma unroll
-                    for (uint32_t i = 0; i < STORE_BLOCK_N / kNumElemsPerBankGroup; ++ i) {
-                        // Calculate the index of the bank group to be written in the atom
-                        auto bank_group_index = i + lane_idx * (kSwizzleCDMode / kNumBankGroupBytes);
+                    for (uint32_t s = 0; s < kNumStores; ++ s, advance_store_pipeline()) {
+                        if (epilogue_warp_idx == 0)
+                            cute::tma_store_wait<kNumTMAStoreStages - 1>();
+                        cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
 
-                        // Reshape the atom in another view and swizzle
-                        //  - original: `(LAYOUT_AD_M, kSwizzleCDMode / kNumBankGroupBytes)`
-                        //  - new: `(LAYOUT_AD_M * kSwizzleCDMode / kNumBankGroupBytes / 8, 8)`
-                        // NOTES: "8" is the number of bank groups, "16" is the swizzling pattern
-                        constexpr bool kHasShortcut = (kSwizzleCDMode / kNumBankGroupBytes) == 8;
-                        auto row = kHasShortcut ? (i / 8 + lane_idx) : (bank_group_index / 8);
-                        auto col = kHasShortcut ? (i) : (bank_group_index % 8);
-                        col ^= row % (kSwizzleCDMode / 16);
+                        const auto m_idx = scheduler.template get_global_idx<(not is_m_grouped_contiguous(kGemmType)), IndexType::MN>(shape_m, BLOCK_M, m_block_idx) + w * WAVE_BLOCK_M;
+                        const auto n_idx = epilogue_type_t::apply_index_n<STORE_BLOCK_N>(n_block_idx * BLOCK_N + s * STORE_BLOCK_N);
 
-                        // Source and destination memory address
-                        uint32_t tmem_addr = accum_stage_idx * kNumMWaves * BLOCK_N +               // Accumulator offset
-                                             w * BLOCK_N +                                          // Wave offset
-                                             s * STORE_BLOCK_N + i * kNumElemsPerBankGroup;         // In-block offset
-                        auto smem_ptr = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]) +        // Base pointer
-                                        epilogue_warp_idx * 32 * kSwizzleCDMode +                   // Warp offset
-                                        row * (kNumBankGroupBytes * 8) + col * kNumBankGroupBytes;  // In-atom offset
+                        #pragma unroll
+                        for (uint32_t i = 0; i < STORE_BLOCK_N / kNumElemsPerBankGroup; ++ i) {
+                            auto bank_group_index = i + lane_idx * (kSwizzleCDMode / kNumBankGroupBytes);
+                            constexpr bool kHasShortcut = (kSwizzleCDMode / kNumBankGroupBytes) == 8;
+                            auto row = kHasShortcut ? (i / 8 + lane_idx) : (bank_group_index / 8);
+                            auto col = kHasShortcut ? (i) : (bank_group_index % 8);
+                            col ^= row % (kSwizzleCDMode / 16);
 
-                        // Load from tensor memory, store into shared memory
-                        uint32_t values[kNumElemsPerBankGroup];
-                        if constexpr (cute::is_same_v<cd_dtype_t, float>) {
-                            // For FP32 output, read and store
-                            DG_STATIC_ASSERT(kNumElemsPerBankGroup == 4, "Invalid type");
-                            cute::SM100_TMEM_LOAD_32dp32b4x::copy(tmem_addr,
-                                values[0], values[1], values[2], values[3]);
-                            cutlass::arch::fence_view_async_tmem_load();
-                            st_shared(smem_ptr, values[0], values[1], values[2], values[3]);
-                        } else {
-                            // For BF16 output, read, cast and store
-                            DG_STATIC_ASSERT(kNumElemsPerBankGroup == 8 and cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Invalid type");
-                            cute::SM100_TMEM_LOAD_32dp32b8x::copy(tmem_addr,
-                                values[0], values[1], values[2], values[3],
-                                values[4], values[5], values[6], values[7]);
-                            cutlass::arch::fence_view_async_tmem_load();
-                            st_shared(smem_ptr,
-                                      cast_into_bf16_and_pack(values[0], values[1]),
-                                      cast_into_bf16_and_pack(values[2], values[3]),
-                                      cast_into_bf16_and_pack(values[4], values[5]),
-                                      cast_into_bf16_and_pack(values[6], values[7]));
+                            uint32_t tmem_addr = accum_stage_idx * kNumMWaves * BLOCK_N +
+                                                 w * BLOCK_N +
+                                                 s * STORE_BLOCK_N + i * kNumElemsPerBankGroup;
+                            auto smem_ptr = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]) +
+                                            epilogue_warp_idx * 32 * kSwizzleCDMode +
+                                            row * (kNumBankGroupBytes * 8) + col * kNumBankGroupBytes;
+
+                            uint32_t values[kNumElemsPerBankGroup];
+                            if constexpr (cute::is_same_v<internal_cd_dtype_t, float>) {
+                                DG_STATIC_ASSERT(kNumElemsPerBankGroup == 4, "Invalid type");
+                                cute::SM100_TMEM_LOAD_32dp32b4x::copy(tmem_addr,
+                                    values[0], values[1], values[2], values[3]);
+                                cutlass::arch::fence_view_async_tmem_load();
+                                st_shared(smem_ptr, values[0], values[1], values[2], values[3]);
+                            } else {
+                                DG_STATIC_ASSERT(kNumElemsPerBankGroup == 8 and cute::is_same_v<internal_cd_dtype_t, cutlass::bfloat16_t>, "Invalid type");
+                                cute::SM100_TMEM_LOAD_32dp32b8x::copy(tmem_addr,
+                                    values[0], values[1], values[2], values[3],
+                                    values[4], values[5], values[6], values[7]);
+                                cutlass::arch::fence_view_async_tmem_load();
+                                st_shared(smem_ptr,
+                                          cast_into_bf16_and_pack(values[0], values[1]),
+                                          cast_into_bf16_and_pack(values[2], values[3]),
+                                          cast_into_bf16_and_pack(values[4], values[5]),
+                                          cast_into_bf16_and_pack(values[6], values[7]));
+                            }
+                        }
+
+                        if (w == kNumMWaves - 1 and s == kNumStores - 1) {
+                            tcgen05_before_thread_sync();
+                            tmem_empty_barriers[accum_stage_idx]->arrive(0u);
+                        }
+
+                        cute::tma_store_fence();
+                        cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
+                        if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                            if constexpr (kGemmType == GemmType::Batched) {
+                                using cute_tma_t = cute::conditional_t<kWithAccumulation,
+                                    cute::SM90_TMA_REDUCE_ADD_3D, cute::SM90_TMA_STORE_3D>;
+                                cute_tma_t::copy(&tensor_map_cd, smem_cd[tma_stage_idx],
+                                                 n_idx, m_idx, scheduler.current_group_idx);
+                            } else {
+                                using cute_tma_t = cute::conditional_t<kWithAccumulation,
+                                    cute::SM90_TMA_REDUCE_ADD_2D, cute::SM90_TMA_STORE_2D>;
+                                cute_tma_t::copy(&tensor_map_cd, smem_cd[tma_stage_idx], n_idx, m_idx);
+                            }
+                            cute::tma_store_arrive();
                         }
                     }
+                }
+            } else {
+                // MXFP8 epilogue: TMEM → registers → quantize → SMEM → TMA store
+                // Independent s-loop with own TMA pipeline, same structure as BF16 path
+                constexpr uint32_t kNumGroups32 = BLOCK_N / 32;
+                const uint32_t local_m = epilogue_warp_idx * 32 + lane_idx;
+                const uint32_t tmem_base = accum_stage_idx * kNumMWaves * BLOCK_N;
 
-                    // Notify tensor memory empty (only at the leader CTA) arrival ASAP
-                    // NOTES: only the last stage needs to do this
-                    if (w == kNumMWaves - 1 and s == BLOCK_N / STORE_BLOCK_N - 1) {
-                        tcgen05_before_thread_sync();
-                        tmem_empty_barriers[accum_stage_idx]->arrive(0u);
-                    }
+                #pragma unroll
+                for (uint32_t w = 0; w < kNumMWaves; ++ w) {
+                    #pragma unroll
+                    for (uint32_t g = 0; g < kNumGroups32; ++ g, advance_store_pipeline()) {
+                        // Pipeline: wait for SMEM stage to be free
+                        if (epilogue_warp_idx == 0)
+                            cute::tma_store_wait<kNumTMAStoreStages - 1>();
+                        cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
 
-                    // Synchronize all threads and issue TMA
-                    cute::tma_store_fence();
-                    cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
-                    if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
-                        if constexpr (kGemmType == GemmType::Batched) {
-                            using cute_tma_t = cute::conditional_t<kWithAccumulation,
-                                cute::SM90_TMA_REDUCE_ADD_3D, cute::SM90_TMA_STORE_3D>;
-                            cute_tma_t::copy(&tensor_map_cd, smem_cd[tma_stage_idx],
-                                             n_idx, m_idx, scheduler.current_group_idx);
-                        } else {
-                            using cute_tma_t = cute::conditional_t<kWithAccumulation,
-                                cute::SM90_TMA_REDUCE_ADD_2D, cute::SM90_TMA_STORE_2D>;
-                            cute_tma_t::copy(&tensor_map_cd, smem_cd[tma_stage_idx], n_idx, m_idx);
+                        const auto m_idx = scheduler.template get_global_idx<(not is_m_grouped_contiguous(kGemmType)), IndexType::MN>(shape_m, BLOCK_M, m_block_idx) + w * WAVE_BLOCK_M;
+
+                        // Load 32 consecutive N-elements from TMEM (8 loads × 4 values)
+                        float group_vals[32];
+                        float group_max = 0.0f;
+
+                        #pragma unroll
+                        for (uint32_t i = 0; i < 8; ++ i) {
+                            uint32_t tmem_addr = tmem_base + w * BLOCK_N + g * 32 + i * 4;
+                            uint32_t raw[4];
+                            cute::SM100_TMEM_LOAD_32dp32b4x::copy(tmem_addr, raw[0], raw[1], raw[2], raw[3]);
+                            cutlass::arch::fence_view_async_tmem_load();
+                            #pragma unroll
+                            for (uint32_t j = 0; j < 4; ++ j) {
+                                float val = *reinterpret_cast<float*>(&raw[j]);
+                                group_vals[i * 4 + j] = val;
+                                group_max = fmaxf(group_max, fabsf(val));
+                            }
                         }
-                        cute::tma_store_arrive();
+
+                        // Quantize
+                        uint8_t e8m0 = compute_e8m0_exponent(group_max);
+                        float inv_scale = (e8m0 == 0 and group_max == 0.0f) ? 0.0f : exp2f(127.0f - static_cast<float>(e8m0));
+
+                        // Write FP8 to SMEM (32 bytes per row, contiguous, no swizzle)
+                        auto smem_fp8_row = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]) +
+                                            (epilogue_warp_idx * 32 + lane_idx) * 32;
+                        #pragma unroll
+                        for (uint32_t j = 0; j < 32; j += 4) {
+                            uint32_t packed = pack_fp8x4(
+                                float_to_fp8_e4m3_sat(group_vals[j + 0] * inv_scale),
+                                float_to_fp8_e4m3_sat(group_vals[j + 1] * inv_scale),
+                                float_to_fp8_e4m3_sat(group_vals[j + 2] * inv_scale),
+                                float_to_fp8_e4m3_sat(group_vals[j + 3] * inv_scale));
+                            st_shared(reinterpret_cast<uint32_t*>(smem_fp8_row + j), packed);
+                        }
+
+                        // Write E8M0 scale directly to global memory (too small for TMA)
+                        if (local_m < shape_m) {
+                            const auto gmem_m_idx = m_idx + local_m;
+                            gmem_cd_sf_ptr[gmem_m_idx * cd_sf_stride + n_block_idx * (BLOCK_N / 32) + g] = e8m0;
+                        }
+
+                        // Notify tensor memory empty after last group of last wave
+                        if (w == kNumMWaves - 1 and g == kNumGroups32 - 1) {
+                            tcgen05_before_thread_sync();
+                            tmem_empty_barriers[accum_stage_idx]->arrive(0u);
+                        }
+
+                        // TMA store: SMEM → HBM
+                        cute::tma_store_fence();
+                        cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
+                        if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                            cute::SM90_TMA_STORE_2D::copy(&tensor_map_cd,
+                                smem_cd[tma_stage_idx],
+                                n_block_idx * BLOCK_N + g * 32, m_idx);
+                            cute::tma_store_arrive();
+                        }
                     }
                 }
             }

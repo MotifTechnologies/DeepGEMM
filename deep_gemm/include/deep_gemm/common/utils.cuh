@@ -158,6 +158,36 @@ __device__ __forceinline__ int cast_into_bf16_and_pack(old_t& x, old_t& y) {
     return *reinterpret_cast<int*>(&bf16x2);
 }
 
+// MXFP8 epilogue utilities
+
+// Compute E8M0 exponent from max absolute value
+// E = clamp(floor(log2(max_abs / 448.0)) + 127, 0, 254)
+__device__ __forceinline__ uint8_t compute_e8m0_exponent(float max_abs) {
+    if (max_abs <= 0.0f) return 0;
+    int e = __float2int_ru(log2f(max_abs * (1.0f / 448.0f))) + 127;
+    return static_cast<uint8_t>(min(max(e, 0), 254));
+}
+
+// Warp-level max reduction across col_idx (4 threads that each hold part of a 32-element N group)
+// After this, all 4 threads (col_idx 0-3) share the same max value
+__device__ __forceinline__ float warp_reduce_max_4(float val) {
+    val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 1));
+    val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 2));
+    return val;
+}
+
+// Pack 4 FP8 bytes into a uint32
+__device__ __forceinline__ uint32_t pack_fp8x4(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
+    return static_cast<uint32_t>(a) | (static_cast<uint32_t>(b) << 8) |
+           (static_cast<uint32_t>(c) << 16) | (static_cast<uint32_t>(d) << 24);
+}
+
+// Convert float to FP8 E4M3 (saturating)
+__device__ __forceinline__ uint8_t float_to_fp8_e4m3_sat(float x) {
+    __nv_fp8_e4m3 fp8_val = __nv_fp8_e4m3(x);
+    return *reinterpret_cast<uint8_t*>(&fp8_val);
+}
+
 __device__ __forceinline__ void prefetch_l1(void *ptr) {
     asm volatile("prefetch.global.L1 [%0];" :: "l"(ptr));
 }

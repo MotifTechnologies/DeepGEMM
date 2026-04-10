@@ -60,6 +60,19 @@ def per_custom_dims_cast_to_fp8(x: torch.Tensor, dims: Tuple, use_ue8m0: bool) -
     return x_scaled, sf.squeeze()
 
 
+def mxfp8_quantize_output(x: torch.Tensor, block_size: int = 32) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert x.dim() == 2
+    assert x.size(1) % block_size == 0, f"N ({x.size(1)}) must be divisible by block_size ({block_size})"
+    m, n = x.shape
+    x_float = x.float()
+    x_view = x_float.view(m, n // block_size, block_size)
+    x_amax = x_view.abs().amax(dim=2).clamp(1e-4)
+    e8m0_exp = torch.clamp(torch.ceil(torch.log2(x_amax / 448.0)) + 127, 0, 254).to(torch.uint8)
+    scale = torch.pow(2.0, e8m0_exp.float() - 127.0).unsqueeze(2)
+    fp8_data = (x_view / scale).to(torch.float8_e4m3fn).view(m, n)
+    return fp8_data, e8m0_exp
+
+
 def _quantize_to_fp4_e2m1(x: torch.Tensor) -> torch.Tensor:
     ax = x.abs().clamp_max(6.0)
     # {0, 0.5, 1, 1.5, 2, 3, 4, 6}
