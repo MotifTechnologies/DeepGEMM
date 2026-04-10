@@ -162,7 +162,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
         DG_HOST_ASSERT(a_dtype == torch::kFloat8_e4m3fn or a_dtype == kPackedFP4);
         DG_HOST_ASSERT(b_dtype == torch::kFloat8_e4m3fn or b_dtype == kPackedFP4);
     }
-    DG_HOST_ASSERT(cd_dtype == torch::kBFloat16 or cd_dtype == torch::kFloat);
+    DG_HOST_ASSERT(cd_dtype == torch::kBFloat16 or cd_dtype == torch::kFloat or cd_dtype == torch::kFloat8_e4m3fn);
 
     // Select M/N block sizes
     auto block_ms = ArchSpec::get_block_m_candidates(kernel_type, major_a, m);

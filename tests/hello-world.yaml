@@ -1,0 +1,76 @@
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainJob
+metadata:
+  name: jangwoong-dg-hello
+  namespace: kbm-g-np-motif
+spec:
+  podTemplateOverrides:
+    - metadata:
+        annotations:
+          k8s.v1.cni.cncf.io/networks: |-
+            kbm-g-np-motif,
+            kbm-g-np-motif,
+            kbm-g-np-motif,
+            kbm-g-np-motif,
+            kbm-g-np-motif,
+            kbm-g-np-motif,
+            kbm-g-np-motif,
+            kbm-g-np-motif
+      spec:
+        containers:
+          - name: node
+            volumeMounts:
+              - mountPath: /dev/shm
+                name: shm
+              - mountPath: /mair
+                name: mair
+        volumes:
+          - emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+            name: shm
+          - name: mair
+            persistentVolumeClaim:
+              claimName: mair
+      targetJobs:
+        - name: node
+  runtimeRef:
+    apiGroup: trainer.kubeflow.org
+    kind: ClusterTrainingRuntime
+    name: torch-distributed
+  suspend: false
+  trainer:
+    args:
+      - /bin/bash
+      - '-c'
+      - |
+        echo "Hello from $(hostname)"
+        nvidia-smi
+        python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}, GPU: {torch.cuda.get_device_name(0)}, Arch: {torch.cuda.get_device_capability(0)}')"
+        echo "Hello world done!"
+    env:
+      - name: PYTHONUNBUFFERED
+        value: '1'
+      - name: NODE_NAME
+        valueFrom:
+          fieldRef:
+            fieldPath: spec.nodeName
+      - name: JOB_NAME
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.labels['job-name']
+    image: >-
+      ghcr.io/motiftechnologies/llm-training:v0.1.6
+    numNodes: 1
+    numProcPerNode: 8
+    resourcesPerNode:
+      limits:
+        cpu: '96'
+        memory: 1024Gi
+        nvidia.com/gpu: '8'
+        nvidia.com/mlnxnics: '8'
+      requests:
+        cpu: '96'
+        memory: 1024Gi
+        nvidia.com/gpu: '8'
+        nvidia.com/mlnxnics: '8'

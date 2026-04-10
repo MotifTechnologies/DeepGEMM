@@ -140,6 +140,92 @@ static void fp8_fp4_gemm_tt(const std::pair<torch::Tensor, torch::Tensor>& a,
                     d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast);
 }
 
+static void fp8_gemm_nt_mxfp8out(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                  const std::pair<torch::Tensor, torch::Tensor>& b,
+                                  const torch::Tensor& d,
+                                  const torch::Tensor& d_sf,
+                                  const std::string& compiled_dims,
+                                  const bool& disable_ue8m0_cast) {
+    // Shape must be `[M, K] @ [N, K].T` with MXFP8 output
+    const auto& major_a = get_major_type_ab(a.first);
+    const auto& major_b = get_major_type_ab(b.first);
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(major_b == cute::UMMA::Major::K);
+
+    // C/D checks
+    DG_HOST_ASSERT(d.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(d_sf.scalar_type() == torch::kUInt8 or d_sf.scalar_type() == torch::kFloat8_e4m3fn);
+    check_major_type_cd(d);
+
+    // Type and shape checks
+    const auto arch_major = device_runtime->get_arch_major();
+    const auto [m , k ] = check_ab_fp8_fp4(a.first, major_a, arch_major);
+    const auto [n , k_] = check_ab_fp8_fp4(b.first, major_b, arch_major);
+    const auto [m_, n_] = get_shape<2>(d);
+    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
+    DG_HOST_ASSERT(n % 32 == 0);
+
+    // Scale shape check
+    const auto [sm, sn] = get_shape<2>(d_sf);
+    DG_HOST_ASSERT(sm == m and sn == n / 32);
+
+    // Do nothing if empty
+    if (m == 0 or n == 0 or k == 0)
+        return;
+
+    // Transform SFA and SFB into compute-required layout
+    std::optional<std::tuple<int, int, int>> recipe = std::nullopt;
+    const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
+        a.second, b.second, m, n, k, recipe, std::nullopt, std::nullopt, std::nullopt, std::nullopt, disable_ue8m0_cast);
+
+    // Dispatch
+    if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
+        sm90_fp8_gemm_1d1d_mxfp8out(a.first, sfa, b.first, sfb, d, d_sf, m, n, k, major_a, major_b, compiled_dims);
+    } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
+        sm100_fp8_gemm_1d1d_mxfp8out(a.first, sfa, b.first, sfb, d, d_sf, m, n, k, gran_k_a, gran_k_b, major_a, major_b, compiled_dims);
+    } else {
+        DG_HOST_UNREACHABLE("MXFP8 output requires SM90 or SM100");
+    }
+}
+
+static void m_grouped_fp8_gemm_nt_contiguous_mxfp8out(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                                       const std::pair<torch::Tensor, torch::Tensor>& b,
+                                                       const torch::Tensor& d,
+                                                       const torch::Tensor& d_sf,
+                                                       const torch::Tensor& grouped_layout,
+                                                       const std::string& compiled_dims,
+                                                       const bool& disable_ue8m0_cast) {
+    const auto& major_a = get_major_type_ab(a.first);
+    const auto& major_b = get_major_type_ab(b.first);
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(grouped_layout.is_contiguous());
+
+    const auto arch_major = device_runtime->get_arch_major();
+    const auto [m , k ] = check_ab_fp8_fp4(a.first, major_a, arch_major);
+    const auto [num_groups, n, k_] = check_grouped_ab_fp8_fp4(b.first, major_b, arch_major);
+    const auto [m_, n_] = get_shape<2>(d);
+    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
+    DG_HOST_ASSERT(n % 32 == 0);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kFloat8_e4m3fn);
+
+    const auto [sm, sn] = get_shape<2>(d_sf);
+    DG_HOST_ASSERT(sm == m and sn == n / 32);
+
+    check_major_type_cd(d);
+    if (m == 0) return;
+
+    std::optional<std::tuple<int, int, int>> recipe = std::nullopt;
+    const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
+        a.second, b.second, m, n, k, recipe, std::nullopt, std::nullopt, std::nullopt, num_groups, disable_ue8m0_cast);
+
+    if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
+        sm100_m_grouped_fp8_gemm_contiguous_1d1d_mxfp8out(a.first, sfa, b.first, sfb, d, d_sf, grouped_layout,
+                                                           num_groups, m, n, k, gran_k_a, gran_k_b, major_a, major_b, compiled_dims);
+    } else {
+        DG_HOST_UNREACHABLE("m_grouped MXFP8 output requires SM100");
+    }
+}
+
 static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
                                                  const std::pair<torch::Tensor, torch::Tensor>& b,
                                                  const torch::Tensor& d,
@@ -651,6 +737,17 @@ static void register_apis(pybind11::module_& m) {
           py::arg("ks_tensor"), py::arg("c") = std::nullopt,
           py::arg("recipe") = std::make_tuple(1, 1, 128),
           py::arg("compiled_dims") = "mn");
+
+    // MXFP8 output GEMM
+    m.def("fp8_gemm_nt_mxfp8out", &fp8_gemm_nt_mxfp8out,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("d_sf"),
+          py::arg("compiled_dims") = "nk",
+          py::arg("disable_ue8m0_cast") = false);
+
+    m.def("m_grouped_fp8_gemm_nt_contiguous_mxfp8out", &m_grouped_fp8_gemm_nt_contiguous_mxfp8out,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("d_sf"), py::arg("grouped_layout"),
+          py::arg("compiled_dims") = "nk",
+          py::arg("disable_ue8m0_cast") = false);
 
     // FP8 GEMM alias names
     m.attr("fp8_gemm_nt") = m.attr("fp8_fp4_gemm_nt");

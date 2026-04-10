@@ -21,4 +21,4 @@ deep_gemm/include/cutlass
 stubs/
 
 # Symlinks to compiled extensions
-deep_gemm/*.so
+deep_gemm/*.sotraces/

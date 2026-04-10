@@ -32,6 +32,11 @@ public:
         CUtensorMap tensor_map_sfa;
         CUtensorMap tensor_map_sfb;
         CUtensorMap tensor_map_cd;
+        CUtensorMap tensor_map_cd_sf;
+        void* gmem_cd_sf_ptr;
+        uint32_t cd_sf_stride;
+        void* gmem_cd_fp8_ptr;
+        uint32_t cd_fp8_stride;
     };
 
     static std::string generate_impl(const Args& args) {
@@ -79,7 +84,9 @@ static void __instantiate_kernel() {{
             args.grouped_layout, args.m, args.n, args.k,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_sfa, args.tensor_map_sfb,
-            args.tensor_map_cd));
+            args.tensor_map_cd, args.tensor_map_cd_sf,
+            args.gmem_cd_sf_ptr, args.cd_sf_stride,
+            args.gmem_cd_fp8_ptr, args.cd_fp8_stride));
     }
 };
 
@@ -137,10 +144,88 @@ static void sm100_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
         .tensor_map_b = tensor_map_b,
         .tensor_map_sfa = tensor_map_sfa,
         .tensor_map_sfb = tensor_map_sfb,
-        .tensor_map_cd = tensor_map_cd
+        .tensor_map_cd = tensor_map_cd,
+        .tensor_map_cd_sf = {},
+        .gmem_cd_sf_ptr = nullptr,
+        .cd_sf_stride = 0,
+        .gmem_cd_fp8_ptr = nullptr,
+        .cd_fp8_stride = 0
     };
     const auto& code = SM100FP8FP4Gemm1D1DRuntime::generate(args);
     const auto& runtime = compiler->build("sm100_fp8_fp4_gemm_1d1d", code);
+    SM100FP8FP4Gemm1D1DRuntime::launch(runtime, args);
+}
+
+static void sm100_fp8_gemm_1d1d_mxfp8out(const torch::Tensor& a, const torch::Tensor& sfa,
+                                          const torch::Tensor& b, const torch::Tensor& sfb,
+                                          const torch::Tensor& d, const torch::Tensor& d_sf,
+                                          const int& m, const int& n, const int& k,
+                                          const int& gran_k_a, const int& gran_k_b,
+                                          const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+                                          const std::string& compiled_dims) {
+    DG_HOST_ASSERT(d.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(d_sf.scalar_type() == torch::kUInt8 or d_sf.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(n % 32 == 0);
+
+    // Use BF16 as proxy for config selection, then override swizzle for MXFP8
+    auto config = get_best_config<SM100ArchSpec>(
+        GemmType::Normal, KernelType::Kernel1D1D,
+        m, n, k, 1, major_a, major_b,
+        a.scalar_type(), b.scalar_type(),
+        torch::kBFloat16, false,
+        device_runtime->get_num_sms());
+
+    // Keep original BF16 config as-is (no swizzle override).
+    // Ensure block_n >= 32 for MXFP8 block size.
+    if (config.block_n < 32) config.block_n = 32;
+
+    const auto& tensor_map_a = make_tma_a_desc(major_a, a, m, k,
+                                               SM100ArchSpec::get_ab_load_block_m(config.multicast_config, config.block_m),
+                                               config.block_k,
+                                               static_cast<int>(a.stride(get_non_contiguous_dim(major_a))), 1,
+                                               config.smem_config.swizzle_a_mode);
+    const auto& tensor_map_b = make_tma_b_desc(major_b, b, n, k,
+                                               SM100ArchSpec::get_ab_load_block_n(config.multicast_config, config.block_n),
+                                               config.block_k,
+                                               static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), 1,
+                                               config.smem_config.swizzle_b_mode);
+    const auto& tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
+                                                  config.block_m, gran_k_a, 1, 0);
+    const auto& tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
+                                                  config.block_n, gran_k_b, 1, 0);
+
+    // MXFP8: output via global memory direct write. Pass valid descriptor as placeholder.
+    const auto& tensor_map_cd = tensor_map_a;
+
+    // Override cd_dtype
+    auto mxfp8_config = config;
+    mxfp8_config.cd_dtype = torch::kFloat8_e4m3fn;
+
+    const SM100FP8FP4Gemm1D1DRuntime::Args& args = {
+        .m = m, .n = n, .k = k,
+        .num_groups = 1,
+        .gran_k_a = gran_k_a,
+        .gran_k_b = gran_k_b,
+        .compiled_dims = compiled_dims,
+        .epilogue_type = std::nullopt,
+        .gemm_config = mxfp8_config,
+        .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
+                                  config.smem_config.smem_size,
+                                  config.multicast_config.num_multicast),
+        .grouped_layout = nullptr,
+        .tensor_map_a = tensor_map_a,
+        .tensor_map_b = tensor_map_b,
+        .tensor_map_sfa = tensor_map_sfa,
+        .tensor_map_sfb = tensor_map_sfb,
+        .tensor_map_cd = tensor_map_cd,
+        .tensor_map_cd_sf = {},
+        .gmem_cd_sf_ptr = d_sf.data_ptr(),
+        .cd_sf_stride = static_cast<uint32_t>(n / 32),
+        .gmem_cd_fp8_ptr = d.data_ptr(),
+        .cd_fp8_stride = static_cast<uint32_t>(n)
+    };
+    const auto& code = SM100FP8FP4Gemm1D1DRuntime::generate(args);
+    const auto& runtime = compiler->build("sm100_fp8_gemm_1d1d_mxfp8out", code);
     SM100FP8FP4Gemm1D1DRuntime::launch(runtime, args);
 }
 
@@ -206,10 +291,82 @@ static void sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_sfa = tensor_map_sfa,
         .tensor_map_sfb = tensor_map_sfb,
-        .tensor_map_cd = tensor_map_cd
+        .tensor_map_cd = tensor_map_cd,
+        .tensor_map_cd_sf = {},
+        .gmem_cd_sf_ptr = nullptr,
+        .cd_sf_stride = 0,
+        .gmem_cd_fp8_ptr = nullptr,
+        .cd_fp8_stride = 0
     };
     const auto& code = SM100FP8FP4Gemm1D1DRuntime::generate(args);
     const auto& runtime = compiler->build("sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d", code);
+    SM100FP8FP4Gemm1D1DRuntime::launch(runtime, args);
+}
+
+static void sm100_m_grouped_fp8_gemm_contiguous_1d1d_mxfp8out(
+                                                         const torch::Tensor& a, const torch::Tensor& sfa,
+                                                         const torch::Tensor& b, const torch::Tensor& sfb,
+                                                         const torch::Tensor& d, const torch::Tensor& d_sf,
+                                                         const torch::Tensor& grouped_layout,
+                                                         const int& num_groups, const int& m, const int& n, const int& k,
+                                                         const int& gran_k_a, const int& gran_k_b,
+                                                         const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+                                                         const std::string& compiled_dims) {
+    DG_HOST_ASSERT(d.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(n % 32 == 0);
+
+    auto config = get_best_config<SM100ArchSpec>(
+        GemmType::MGroupedContiguous, KernelType::Kernel1D1D,
+        m, n, k, 1, major_a, major_b,
+        a.scalar_type(), b.scalar_type(),
+        torch::kBFloat16, false,
+        device_runtime->get_num_sms());
+
+    if (config.block_n < 32) config.block_n = 32;
+
+    // Override cd_dtype
+    config.cd_dtype = torch::kFloat8_e4m3fn;
+
+    const auto& tensor_map_a = make_tma_a_desc(major_a, a, m, k,
+                                               SM100ArchSpec::get_ab_load_block_m(config.multicast_config, config.block_m),
+                                               config.block_k,
+                                               static_cast<int>(a.stride(get_non_contiguous_dim(major_a))), 1,
+                                               config.smem_config.swizzle_a_mode);
+    const auto& tensor_map_b = make_tma_b_desc(major_b, b, n, k,
+                                               SM100ArchSpec::get_ab_load_block_n(config.multicast_config, config.block_n),
+                                               config.block_k,
+                                               static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), num_groups,
+                                               config.smem_config.swizzle_b_mode);
+    const auto& tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
+                                                  config.block_m, gran_k_a, 1, 0);
+    const auto& tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
+                                                  config.block_n, gran_k_b, num_groups, 0);
+
+    const SM100FP8FP4Gemm1D1DRuntime::Args& args = {
+        .m = m, .n = n, .k = k,
+        .num_groups = num_groups,
+        .gran_k_a = gran_k_a,
+        .gran_k_b = gran_k_b,
+        .compiled_dims = compiled_dims,
+        .epilogue_type = std::nullopt,
+        .gemm_config = config,
+        .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
+                                  config.smem_config.smem_size,
+                                  config.multicast_config.num_multicast),
+        .grouped_layout = grouped_layout.data_ptr(),
+        .tensor_map_a = tensor_map_a,
+        .tensor_map_b = tensor_map_b,
+        .tensor_map_sfa = tensor_map_sfa,
+        .tensor_map_sfb = tensor_map_sfb,
+        .tensor_map_cd = tensor_map_a,  // placeholder, not used in MXFP8 path
+        .tensor_map_cd_sf = {},
+        .gmem_cd_sf_ptr = d_sf.data_ptr(),
+        .cd_sf_stride = static_cast<uint32_t>(n / 32),
+        .gmem_cd_fp8_ptr = d.data_ptr(),
+        .cd_fp8_stride = static_cast<uint32_t>(n)
+    };
+    const auto& code = SM100FP8FP4Gemm1D1DRuntime::generate(args);
+    const auto& runtime = compiler->build("sm100_m_grouped_fp8_gemm_contiguous_1d1d_mxfp8out", code);
     SM100FP8FP4Gemm1D1DRuntime::launch(runtime, args);
 }
 
@@ -267,7 +424,12 @@ static void sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
         .tensor_map_b = tensor_map_b,
         .tensor_map_sfa = tensor_map_sfa,
         .tensor_map_sfb = tensor_map_sfb,
-        .tensor_map_cd = tensor_map_cd
+        .tensor_map_cd = tensor_map_cd,
+        .tensor_map_cd_sf = {},
+        .gmem_cd_sf_ptr = nullptr,
+        .cd_sf_stride = 0,
+        .gmem_cd_fp8_ptr = nullptr,
+        .cd_fp8_stride = 0
     };
     const auto& code = SM100FP8FP4Gemm1D1DRuntime::generate(args);
     const auto& runtime = compiler->build("sm100_m_grouped_fp8_fp4_gemm_masked_1d1d", code);
@@ -338,7 +500,12 @@ static void sm100_k_grouped_fp8_gemm_1d1d(const torch::Tensor& a, const torch::T
         .tensor_map_b = tensor_map_b,
         .tensor_map_sfa = tensor_map_sfa,
         .tensor_map_sfb = tensor_map_sfb,
-        .tensor_map_cd = tensor_map_cd
+        .tensor_map_cd = tensor_map_cd,
+        .tensor_map_cd_sf = {},
+        .gmem_cd_sf_ptr = nullptr,
+        .cd_sf_stride = 0,
+        .gmem_cd_fp8_ptr = nullptr,
+        .cd_fp8_stride = 0
     };
     const auto& code = SM100FP8FP4Gemm1D1DRuntime::generate(args);
     const auto& runtime = compiler->build("sm100_k_grouped_fp8_gemm_1d1d", code);
@@ -406,7 +573,12 @@ static void sm100_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .tensor_map_b = tensor_map_b,
         .tensor_map_sfa = tensor_map_sfa,
         .tensor_map_sfb = tensor_map_sfb,
-        .tensor_map_cd = tensor_map_cd
+        .tensor_map_cd = tensor_map_cd,
+        .tensor_map_cd_sf = {},
+        .gmem_cd_sf_ptr = nullptr,
+        .cd_sf_stride = 0,
+        .gmem_cd_fp8_ptr = nullptr,
+        .cd_fp8_stride = 0
     };
     const auto& code = SM100FP8FP4Gemm1D1DRuntime::generate(args);
     const auto& runtime = compiler->build("sm100_fp8_gemm_1d1d", code);

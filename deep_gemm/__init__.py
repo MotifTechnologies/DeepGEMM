@@ -45,6 +45,9 @@ try:
         m_grouped_fp8_gemm_nt_masked,
         k_grouped_fp8_gemm_nt_contiguous,
         k_grouped_fp8_gemm_tn_contiguous,
+        # MXFP8 output GEMMs
+        fp8_gemm_nt_mxfp8out,
+        m_grouped_fp8_gemm_nt_contiguous_mxfp8out,
         # BF16 GEMMs
         bf16_gemm_nt, bf16_gemm_nn,
         bf16_gemm_tn, bf16_gemm_tt,
@@ -66,6 +69,8 @@ try:
         get_mk_alignment_for_contiguous_layout
     )
 
+    # Some alias for legacy supports
+    # TODO: remove these later
     # Some alias for legacy supports
     # TODO: remove these later
     fp8_m_grouped_gemm_nt_masked = m_grouped_fp8_gemm_nt_masked

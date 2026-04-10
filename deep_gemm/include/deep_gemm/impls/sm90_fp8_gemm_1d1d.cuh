@@ -36,12 +36,14 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_b_base,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_sfb,
-                        const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
+                        const __grid_constant__ cute::TmaDescriptor tensor_map_cd,
+                        const __grid_constant__ cute::TmaDescriptor tensor_map_cd_sf) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
     // Scaling checks
     DG_STATIC_ASSERT(kNumTMAThreads == 128 and kNumMathThreads % 128 == 0, "Invalid Threads");
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
-    DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float>, "Invalid C/D data dtype");
+    DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float> or cute::is_same_v<cd_dtype_t, __nv_fp8_e4m3>, "Invalid C/D data dtype");
+    constexpr bool kIsMXFP8Output = cute::is_same_v<cd_dtype_t, __nv_fp8_e4m3>;
     DG_STATIC_ASSERT(kGemmType == GemmType::Normal or kGemmType == GemmType::KGroupedContiguous, "Invalid GEMM type");
 
     // Types
@@ -56,7 +58,10 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
 
     // Shared memory
     static constexpr uint32_t SMEM_TENSOR_MAP_SIZE = (kGemmType == GemmType::KGroupedContiguous ? sizeof(cute::TmaDescriptor) * 4 : 0);
-    static constexpr uint32_t SMEM_D_SIZE = BLOCK_M * BLOCK_N * sizeof(float);
+    // For MXFP8 output: FP8 data + E8M0 scales; for FP32 output: FP32 accumulators
+    static constexpr uint32_t SMEM_D_FP8_SIZE = constexpr_align(BLOCK_M * BLOCK_N * sizeof(__nv_fp8_e4m3), 1024u);
+    static constexpr uint32_t SMEM_D_SF_SIZE = constexpr_align(BLOCK_M * (BLOCK_N / 32) * sizeof(uint8_t), 128u);
+    static constexpr uint32_t SMEM_D_SIZE = kIsMXFP8Output ? (SMEM_D_FP8_SIZE + SMEM_D_SF_SIZE) : (BLOCK_M * BLOCK_N * sizeof(float));
     static constexpr uint32_t SMEM_A_SIZE_PER_STAGE = BLOCK_M * BLOCK_K * sizeof(__nv_fp8_e4m3);
     static constexpr uint32_t SMEM_B_SIZE_PER_STAGE = BLOCK_N * BLOCK_K * sizeof(__nv_fp8_e4m3);
     static constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = BLOCK_M * sizeof(float);
@@ -75,6 +80,8 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
         cute::prefetch_tma_descriptor(&tensor_map_sfa);
         cute::prefetch_tma_descriptor(&tensor_map_sfb);
         cute::prefetch_tma_descriptor(&tensor_map_cd);
+        if constexpr (kIsMXFP8Output)
+            cute::prefetch_tma_descriptor(&tensor_map_cd_sf);
     }
     __syncwarp();
 
@@ -347,25 +354,100 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
                 cute::tma_store_wait<0>();
             cutlass::arch::NamedBarrier::sync(128, math_wg_idx);
 
-            // Store to D shared memory
-            const auto& smem_d_0 = reinterpret_cast<float2*>(smem_d + r_0 * BLOCK_N + col_idx * 2);
-            const auto& smem_d_1 = reinterpret_cast<float2*>(smem_d + r_1 * BLOCK_N + col_idx * 2);
-            #pragma unroll
-            for (auto i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
-                st_shared(smem_d_0 + i * 4, {final_accum[i * 4 + 0], final_accum[i * 4 + 1]});
-                st_shared(smem_d_1 + i * 4, {final_accum[i * 4 + 2], final_accum[i * 4 + 3]});
-            }
-            cute::tma_store_fence();
-            cutlass::arch::NamedBarrier::sync(128, math_wg_idx);
+            if constexpr (not kIsMXFP8Output) {
+                // FP32 output path: store to D shared memory
+                const auto& smem_d_0 = reinterpret_cast<float2*>(smem_d + r_0 * BLOCK_N + col_idx * 2);
+                const auto& smem_d_1 = reinterpret_cast<float2*>(smem_d + r_1 * BLOCK_N + col_idx * 2);
+                #pragma unroll
+                for (auto i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
+                    st_shared(smem_d_0 + i * 4, {final_accum[i * 4 + 0], final_accum[i * 4 + 1]});
+                    st_shared(smem_d_1 + i * 4, {final_accum[i * 4 + 2], final_accum[i * 4 + 3]});
+                }
+                cute::tma_store_fence();
+                cutlass::arch::NamedBarrier::sync(128, math_wg_idx);
 
-            // Use TMA store to write back to global memory
-            if (warp_idx % 4 == 0 and cute::elect_one_sync()) {
-                cute::SM90_TMA_REDUCE_ADD_2D::copy(
-                    &tensor_map_cd, smem_d_0, n_block_idx * BLOCK_N,
-                    current_group_idx * shape_m + m_block_idx * BLOCK_M + r_0);
-                cute::tma_store_arrive();
+                // Use TMA store to write back to global memory
+                if (warp_idx % 4 == 0 and cute::elect_one_sync()) {
+                    cute::SM90_TMA_REDUCE_ADD_2D::copy(
+                        &tensor_map_cd, smem_d_0, n_block_idx * BLOCK_N,
+                        current_group_idx * shape_m + m_block_idx * BLOCK_M + r_0);
+                    cute::tma_store_arrive();
+                }
+                __syncwarp();
+            } else {
+                // MXFP8 output path: quantize FP32 accumulators to FP8 + E8M0 scales
+                auto smem_d_fp8 = reinterpret_cast<uint8_t*>(smem_buffer + SMEM_TENSOR_MAP_SIZE);
+                auto smem_d_sf = reinterpret_cast<uint8_t*>(smem_buffer + SMEM_TENSOR_MAP_SIZE + SMEM_D_FP8_SIZE);
+
+                // Process each group of 32 N-elements
+                // In WGMMA layout: col_idx = lane_idx % 4, each thread holds pairs at N positions col_idx*2 + i*8, col_idx*2 + i*8 + 1
+                // A group of 32 N-elements spans 4 consecutive i values (i_base, i_base+1, i_base+2, i_base+3)
+                constexpr uint32_t kNumGroups32 = BLOCK_N / 32;
+
+                #pragma unroll
+                for (uint32_t g = 0; g < kNumGroups32; ++ g) {
+                    // Each group of 32 N-elements maps to i_base = g * 4 in the accumulator indexing
+                    const uint32_t i_base = g * 4;
+
+                    // Compute local max of this thread's 8 elements in the group (4 pairs for r_0 and r_1)
+                    float local_max_r0 = 0.0f, local_max_r1 = 0.0f;
+                    #pragma unroll
+                    for (uint32_t di = 0; di < 4; ++ di) {
+                        const uint32_t acc_idx = (i_base + di) * 4;
+                        local_max_r0 = fmaxf(local_max_r0, fmaxf(fabsf(final_accum[acc_idx + 0]), fabsf(final_accum[acc_idx + 1])));
+                        local_max_r1 = fmaxf(local_max_r1, fmaxf(fabsf(final_accum[acc_idx + 2]), fabsf(final_accum[acc_idx + 3])));
+                    }
+
+                    // Warp-level reduction across col_idx (4 threads) for each row
+                    float group_max_r0 = warp_reduce_max_4(local_max_r0);
+                    float group_max_r1 = warp_reduce_max_4(local_max_r1);
+
+                    // Compute E8M0 exponents
+                    uint8_t e8m0_r0 = compute_e8m0_exponent(group_max_r0);
+                    uint8_t e8m0_r1 = compute_e8m0_exponent(group_max_r1);
+                    float inv_scale_r0 = (e8m0_r0 == 0 and group_max_r0 == 0.0f) ? 0.0f : exp2f(127.0f - static_cast<float>(e8m0_r0));
+                    float inv_scale_r1 = (e8m0_r1 == 0 and group_max_r1 == 0.0f) ? 0.0f : exp2f(127.0f - static_cast<float>(e8m0_r1));
+
+                    // Convert to FP8 and store to SMEM
+                    #pragma unroll
+                    for (uint32_t di = 0; di < 4; ++ di) {
+                        const uint32_t acc_idx = (i_base + di) * 4;
+                        uint8_t fp8_r0_0 = float_to_fp8_e4m3_sat(final_accum[acc_idx + 0] * inv_scale_r0);
+                        uint8_t fp8_r0_1 = float_to_fp8_e4m3_sat(final_accum[acc_idx + 1] * inv_scale_r0);
+                        uint8_t fp8_r1_0 = float_to_fp8_e4m3_sat(final_accum[acc_idx + 2] * inv_scale_r1);
+                        uint8_t fp8_r1_1 = float_to_fp8_e4m3_sat(final_accum[acc_idx + 3] * inv_scale_r1);
+
+                        // N position = col_idx * 2 + di * 8
+                        const uint32_t n_pos = col_idx * 2 + di * 8;
+                        smem_d_fp8[r_0 * BLOCK_N + g * 32 + n_pos + 0] = fp8_r0_0;
+                        smem_d_fp8[r_0 * BLOCK_N + g * 32 + n_pos + 1] = fp8_r0_1;
+                        smem_d_fp8[r_1 * BLOCK_N + g * 32 + n_pos + 0] = fp8_r1_0;
+                        smem_d_fp8[r_1 * BLOCK_N + g * 32 + n_pos + 1] = fp8_r1_1;
+                    }
+
+                    // Store E8M0 scale (one per 32-element group per row, only col_idx == 0 writes)
+                    if (col_idx == 0) {
+                        smem_d_sf[r_0 * (BLOCK_N / 32) + g] = e8m0_r0;
+                        smem_d_sf[r_1 * (BLOCK_N / 32) + g] = e8m0_r1;
+                    }
+                }
+
+                cute::tma_store_fence();
+                cutlass::arch::NamedBarrier::sync(128, math_wg_idx);
+
+                // TMA store FP8 data and scales to global memory
+                if (warp_idx % 4 == 0 and cute::elect_one_sync()) {
+                    const uint32_t m_idx = current_group_idx * shape_m + m_block_idx * BLOCK_M + r_0;
+                    cute::SM90_TMA_STORE_2D::copy(
+                        &tensor_map_cd, smem_d_fp8 + r_0 * BLOCK_N,
+                        n_block_idx * BLOCK_N, m_idx);
+                    cute::SM90_TMA_STORE_2D::copy(
+                        &tensor_map_cd_sf, smem_d_sf + r_0 * (BLOCK_N / 32),
+                        n_block_idx * (BLOCK_N / 32), m_idx);
+                    cute::tma_store_arrive();
+                }
+                __syncwarp();
             }
-            __syncwarp();
         }
     }
 #else
