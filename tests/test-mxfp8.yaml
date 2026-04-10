@@ -1,7 +1,7 @@
 apiVersion: trainer.kubeflow.org/v1alpha1
 kind: TrainJob
 metadata:
-  name: jangwoong-dg-mxfp8v4
+  name: jangwoong-dg-mxfp8v6
   namespace: kbm-g-np-motif
 spec:
   podTemplateOverrides:
@@ -69,8 +69,6 @@ spec:
         mkdir -p traces
         cd tests
         python -B test_mxfp8_breakdown.py 2>&1
-        echo "---"
-        python -B test_mxfp8_profile.py 2>&1
 
         echo "=== Test complete ==="
     env:

@@ -194,8 +194,11 @@ static void sm100_fp8_gemm_1d1d_mxfp8out(const torch::Tensor& a, const torch::Te
     const auto& tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
                                                   config.block_n, gran_k_b, 1, 0);
 
-    // MXFP8: output via global memory direct write. Pass valid descriptor as placeholder.
-    const auto& tensor_map_cd = tensor_map_a;
+    // TMA descriptor for FP8 output: box = STORE_BLOCK_M × 32, no swizzle
+    const auto& tensor_map_cd = make_tma_cd_desc(d, m, n,
+                                                 SM100ArchSpec::get_cd_store_block_m(config.block_m),
+                                                 32,
+                                                 static_cast<int>(d.stride(-2)), 1, 0);
 
     // Override cd_dtype
     auto mxfp8_config = config;
@@ -358,7 +361,10 @@ static void sm100_m_grouped_fp8_gemm_contiguous_1d1d_mxfp8out(
         .tensor_map_b = tensor_map_b,
         .tensor_map_sfa = tensor_map_sfa,
         .tensor_map_sfb = tensor_map_sfb,
-        .tensor_map_cd = tensor_map_a,  // placeholder, not used in MXFP8 path
+        .tensor_map_cd = make_tma_cd_desc(d, m, n,
+                                         SM100ArchSpec::get_cd_store_block_m(config.block_m),
+                                         32,
+                                         static_cast<int>(d.stride(-2)), 1, 0),
         .tensor_map_cd_sf = {},
         .gmem_cd_sf_ptr = d_sf.data_ptr(),
         .cd_sf_stride = static_cast<uint32_t>(n / 32),

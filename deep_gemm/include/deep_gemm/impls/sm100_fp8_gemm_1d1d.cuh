@@ -543,18 +543,23 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                     }
                 }
             } else {
-                // MXFP8 epilogue: TMEM → registers → quantize → global memory direct write
-                // Completely independent from BF16/FP32 TMA pipeline
+                // MXFP8 epilogue: TMEM → registers → quantize → SMEM → TMA store
+                // Independent s-loop with own TMA pipeline, same structure as BF16 path
                 constexpr uint32_t kNumGroups32 = BLOCK_N / 32;
                 const uint32_t local_m = epilogue_warp_idx * 32 + lane_idx;
                 const uint32_t tmem_base = accum_stage_idx * kNumMWaves * BLOCK_N;
 
                 #pragma unroll
                 for (uint32_t w = 0; w < kNumMWaves; ++ w) {
-                    const auto gmem_m_idx = scheduler.template get_global_idx<(not is_m_grouped_contiguous(kGemmType)), IndexType::MN>(shape_m, BLOCK_M, m_block_idx) + w * WAVE_BLOCK_M + local_m;
-
                     #pragma unroll
-                    for (uint32_t g = 0; g < kNumGroups32; ++ g) {
+                    for (uint32_t g = 0; g < kNumGroups32; ++ g, advance_store_pipeline()) {
+                        // Pipeline: wait for SMEM stage to be free
+                        if (epilogue_warp_idx == 0)
+                            cute::tma_store_wait<kNumTMAStoreStages - 1>();
+                        cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
+
+                        const auto m_idx = scheduler.template get_global_idx<(not is_m_grouped_contiguous(kGemmType)), IndexType::MN>(shape_m, BLOCK_M, m_block_idx) + w * WAVE_BLOCK_M;
+
                         // Load 32 consecutive N-elements from TMEM (8 loads × 4 values)
                         float group_vals[32];
                         float group_max = 0.0f;
@@ -577,26 +582,42 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                         uint8_t e8m0 = compute_e8m0_exponent(group_max);
                         float inv_scale = (e8m0 == 0 and group_max == 0.0f) ? 0.0f : exp2f(127.0f - static_cast<float>(e8m0));
 
-                        // Write FP8 to global memory
+                        // Write FP8 to SMEM (32 bytes per row, contiguous, no swizzle)
+                        auto smem_fp8_row = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]) +
+                                            (epilogue_warp_idx * 32 + lane_idx) * 32;
+                        #pragma unroll
+                        for (uint32_t j = 0; j < 32; j += 4) {
+                            uint32_t packed = pack_fp8x4(
+                                float_to_fp8_e4m3_sat(group_vals[j + 0] * inv_scale),
+                                float_to_fp8_e4m3_sat(group_vals[j + 1] * inv_scale),
+                                float_to_fp8_e4m3_sat(group_vals[j + 2] * inv_scale),
+                                float_to_fp8_e4m3_sat(group_vals[j + 3] * inv_scale));
+                            st_shared(reinterpret_cast<uint32_t*>(smem_fp8_row + j), packed);
+                        }
+
+                        // Write E8M0 scale directly to global memory (too small for TMA)
                         if (local_m < shape_m) {
-                            const uint32_t gmem_n_base = n_block_idx * BLOCK_N + g * 32;
-                            #pragma unroll
-                            for (uint32_t j = 0; j < 32; j += 4) {
-                                uint32_t packed = pack_fp8x4(
-                                    float_to_fp8_e4m3_sat(group_vals[j + 0] * inv_scale),
-                                    float_to_fp8_e4m3_sat(group_vals[j + 1] * inv_scale),
-                                    float_to_fp8_e4m3_sat(group_vals[j + 2] * inv_scale),
-                                    float_to_fp8_e4m3_sat(group_vals[j + 3] * inv_scale));
-                                *reinterpret_cast<uint32_t*>(gmem_cd_fp8_ptr + gmem_m_idx * cd_fp8_stride + gmem_n_base + j) = packed;
-                            }
+                            const auto gmem_m_idx = m_idx + local_m;
                             gmem_cd_sf_ptr[gmem_m_idx * cd_sf_stride + n_block_idx * (BLOCK_N / 32) + g] = e8m0;
+                        }
+
+                        // Notify tensor memory empty after last group of last wave
+                        if (w == kNumMWaves - 1 and g == kNumGroups32 - 1) {
+                            tcgen05_before_thread_sync();
+                            tmem_empty_barriers[accum_stage_idx]->arrive(0u);
+                        }
+
+                        // TMA store: SMEM → HBM
+                        cute::tma_store_fence();
+                        cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
+                        if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                            cute::SM90_TMA_STORE_2D::copy(&tensor_map_cd,
+                                smem_cd[tma_stage_idx],
+                                n_block_idx * BLOCK_N + g * 32, m_idx);
+                            cute::tma_store_arrive();
                         }
                     }
                 }
-
-                // Notify tensor memory empty
-                tcgen05_before_thread_sync();
-                tmem_empty_barriers[accum_stage_idx]->arrive(0u);
             }
         }
 
